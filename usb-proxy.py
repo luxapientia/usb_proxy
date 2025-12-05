@@ -633,9 +633,16 @@ class USBProxy:
         log("ENTERING EP0 EVENT LOOP", "INFO")
         log("="*60, "INFO")
         configured = False
+        last_heartbeat = time.time()
         
         while self.running:
             try:
+                # Log heartbeat every 5 seconds to show we're still alive
+                current_time = time.time()
+                if current_time - last_heartbeat > 5.0:
+                    log("Still waiting for control requests from host...", "INFO")
+                    last_heartbeat = current_time
+                
                 event_type, event_data = self.fetch_event()
                 
                 # Log what event we received
