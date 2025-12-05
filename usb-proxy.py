@@ -431,6 +431,16 @@ class USBProxy:
         log(f"EP0 {direction}: {type_str} Type={hex(bmRequestType)} Req={hex(bRequest)} Val={hex(wValue)} Idx={hex(wIndex)} Len={wLength}", "CTRL")
         
         try:
+            # Handle GET_STATUS locally (especially after reset when device might not be ready)
+            if (bmRequestType & USB_TYPE_MASK) == USB_TYPE_STANDARD and \
+               bRequest == USB_REQ_GET_STATUS and \
+               (bmRequestType & USB_DIR_IN):
+                # Return 2 bytes: 0x0000 (bus-powered, no remote wakeup)
+                status_response = struct.pack("<H", 0x0000)
+                self.ep0_write(status_response)
+                log(f"  ✓ GET_STATUS handled locally (0x0000)", "CTRL")
+                return
+            
             # Forward ALL control requests to real device (standard, class, vendor)
             if bmRequestType & USB_DIR_IN:
                 # Check if this is a GET_DESCRIPTOR request - use cached descriptors
@@ -741,23 +751,57 @@ class USBProxy:
                     
                 log(f"Event: {event_name} (type={event_type}, data_len={len(event_data)})", "EVENT")
                 
-                if event_type == USB_RAW_EVENT_CONNECT:
-                    log("="*60, "INFO")
-                    log("USB HOST HOTPLUG: CONNECTED", "SUCCESS")
-                    log("="*60, "INFO")
-                    self.host_connected = True
+                # Handle RESET/DISCONNECT first (like C++ version - proxy.cpp line 396)
+                # Note: C++ treats DISCONNECT like RESET due to dwc2 bug
+                if event_type == USB_RAW_EVENT_RESET or event_type == USB_RAW_EVENT_DISCONNECT:
+                    if event_type == USB_RAW_EVENT_RESET:
+                        log("="*60, "WARN")
+                        log("USB HOST HOTPLUG: RESET", "WARN")
+                        log("="*60, "WARN")
+                    else:
+                        log("="*60, "WARN")
+                        log("USB HOST HOTPLUG: DISCONNECTED (treated as RESET)", "WARN")
+                        log("="*60, "WARN")
+                        self.host_connected = False
                     
-                    # If we were previously configured, clean up and reset state
+                    # Clean up endpoints if configured (like C++ version - proxy.cpp line 403-421)
                     if configured or self.device_configured:
-                        log("Host reconnected, cleaning up previous session...", "INFO")
+                        log("Cleaning up endpoints due to reset...", "INFO")
                         self.cleanup_endpoints()
                         configured = False
                         self.device_configured = False
                     
-                    log("Waiting for control requests from host...", "INFO")
+                    # Reset the device (like C++ version - proxy.cpp line 405)
+                    try:
+                        if self.usb_device:
+                            self.usb_device.reset()
+                            log("✓ Device reset", "SUCCESS")
+                    except Exception as e:
+                        log(f"Error resetting device: {e}", "ERROR")
+                    
+                    log("Host reset. Waiting for re-enumeration...", "INFO")
                     continue
                 
-                elif event_type == USB_RAW_EVENT_CONTROL:
+                # Skip non-CONTROL events (like C++ version - proxy.cpp line 425)
+                # This includes CONNECT, SUSPEND, RESUME - they're just informational
+                if event_type != USB_RAW_EVENT_CONTROL:
+                    if event_type == USB_RAW_EVENT_CONNECT:
+                        # Silently note connection (C++ version doesn't log this)
+                        self.host_connected = True
+                        # If we were previously configured, clean up and reset state
+                        if configured or self.device_configured:
+                            log("Host reconnected, cleaning up previous session...", "INFO")
+                            self.cleanup_endpoints()
+                            configured = False
+                            self.device_configured = False
+                    elif event_type == USB_RAW_EVENT_SUSPEND:
+                        log("USB SUSPEND event received from host", "INFO")
+                    elif event_type == USB_RAW_EVENT_RESUME:
+                        log("USB RESUME event received from host", "INFO")
+                    continue
+                
+                # Process CONTROL events (like C++ version - proxy.cpp line 425+)
+                if event_type == USB_RAW_EVENT_CONTROL:
                     # Parse control request first
                     if len(event_data) < 8:
                         log("ERROR: Control event data too short!", "ERROR")
@@ -773,6 +817,30 @@ class USBProxy:
                         # Just ACK the request - gadget handles address assignment
                         self.ep0_read(0)  # ACK
                         log("✓ SET_ADDRESS ACKed", "SUCCESS")
+                        continue
+                    
+                    # Handle GET_STATUS - return standard response (especially after reset)
+                    # GET_STATUS returns device status: bit 0 = self-powered, bit 1 = remote wakeup
+                    # For most devices, return 0x0000 (bus-powered, no remote wakeup)
+                    if (bmRequestType & USB_TYPE_MASK) == USB_TYPE_STANDARD and \
+                       bRequest == USB_REQ_GET_STATUS and \
+                       (bmRequestType & USB_DIR_IN):
+                        log(f"GET_STATUS: recipient={wIndex & 0xFF} (handled locally)", "INFO")
+                        # Return 2 bytes: 0x0000 (bus-powered, no remote wakeup)
+                        status_response = struct.pack("<H", 0x0000)
+                        self.ep0_write(status_response)
+                        log("✓ GET_STATUS responded (0x0000)", "SUCCESS")
+                        continue
+                    
+                    # Handle GET_CONFIGURATION - return current configuration
+                    if (bmRequestType & USB_TYPE_MASK) == USB_TYPE_STANDARD and \
+                       bRequest == USB_REQ_GET_CONFIGURATION and \
+                       (bmRequestType & USB_DIR_IN):
+                        log(f"GET_CONFIGURATION (handled locally)", "INFO")
+                        # Return current configuration value (1 byte)
+                        config_value = 1 if configured else 0  # Return 0 if not configured
+                        self.ep0_write(bytes([config_value]))
+                        log(f"✓ GET_CONFIGURATION responded ({config_value})", "SUCCESS")
                         continue
                     
                     # Handle SET_CONFIGURATION specially BEFORE forwarding (like C++ version)
@@ -807,67 +875,6 @@ class USBProxy:
                     
                     # Handle all other control requests normally
                     self.handle_control_request(event_data)
-                
-                elif event_type == USB_RAW_EVENT_RESET:
-                    log("="*60, "WARN")
-                    log("USB HOST HOTPLUG: RESET", "WARN")
-                    log("="*60, "WARN")
-                    
-                    # Clean up endpoints if configured
-                    if configured or self.device_configured:
-                        log("Cleaning up endpoints due to reset...", "INFO")
-                        self.cleanup_endpoints()
-                        configured = False
-                        self.device_configured = False
-                    
-                    # Reset the device (like C++ version - see proxy.cpp line 405)
-                    try:
-                        if self.usb_device:
-                            self.usb_device.reset()
-                            log("✓ Device reset", "SUCCESS")
-                    except Exception as e:
-                        log(f"Error resetting device: {e}", "ERROR")
-                    
-                    log("Host reset. Waiting for re-enumeration...", "INFO")
-                    continue
-                    
-                elif event_type == USB_RAW_EVENT_DISCONNECT:
-                    log("="*60, "WARN")
-                    log("USB HOST HOTPLUG: DISCONNECTED", "WARN")
-                    log("="*60, "WARN")
-                    self.host_connected = False
-                    
-                    # Clean up endpoints if configured
-                    if configured or self.device_configured:
-                        log("Cleaning up endpoints due to disconnect...", "INFO")
-                        self.cleanup_endpoints()
-                        configured = False
-                        self.device_configured = False
-                    
-                    # Note: C++ version treats DISCONNECT like RESET for dwc2 bug
-                    # Reset the device to prepare for next connection
-                    try:
-                        if self.usb_device:
-                            self.usb_device.reset()
-                            log("✓ Device reset for next connection", "SUCCESS")
-                    except Exception as e:
-                        log(f"Error resetting device: {e}", "ERROR")
-                    
-                    log("Host disconnected. Waiting for reconnection...", "INFO")
-                    continue
-                    
-                elif event_type == USB_RAW_EVENT_SUSPEND:
-                    log("USB SUSPEND event received from host", "INFO")
-                    continue
-                    
-                elif event_type == USB_RAW_EVENT_RESUME:
-                    log("USB RESUME event received from host", "INFO")
-                    continue
-                    
-                else:
-                    # Handle any other event types
-                    log(f"Unhandled event type: {event_name} (type={event_type})", "INFO")
-                    continue
                     
             except KeyboardInterrupt:
                 log("Keyboard interrupt received, stopping...", "WARN")
