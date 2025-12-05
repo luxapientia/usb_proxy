@@ -102,6 +102,10 @@ class USBProxy:
         self.device_descriptor = None
         self.config_descriptors = {}  # key: config_index, value: bytes
         self.string_descriptors = {}  # key: string_index, value: bytes
+        # Hotplug state tracking
+        self.host_connected = False
+        self.device_configured = False
+        self.endpoints_running = True  # Flag for endpoint threads
         
     def find_and_open_device(self):
         """Find and open the target USB device"""
@@ -466,7 +470,7 @@ class USBProxy:
         """Thread to read from device endpoint (IN) and queue data for host"""
         log(f"Thread started: IN reader for device EP{hex(ep_addr)}", "THREAD")
         
-        while self.running:
+        while self.running and self.endpoints_running:
             try:
                 if ep_type == USB_ENDPOINT_XFER_BULK:
                     data = self.usb_device.read(ep_addr, 4096, timeout=100)
@@ -482,7 +486,7 @@ class USBProxy:
             except usb.core.USBTimeoutError:
                 continue
             except Exception as e:
-                if self.running:
+                if self.running and self.endpoints_running:
                     log(f"IN reader error on EP{hex(ep_addr)}: {e}", "ERROR")
                 break
     
@@ -490,7 +494,7 @@ class USBProxy:
         """Thread to write queued data to gadget endpoint (send to host)"""
         log(f"Thread started: IN writer for gadget EP#{ep_num}", "THREAD")
         
-        while self.running:
+        while self.running and self.endpoints_running:
             try:
                 data = queue.get(timeout=0.1)
                 self.ep_write(ep_num, data)
@@ -498,7 +502,7 @@ class USBProxy:
             except Empty:
                 continue
             except Exception as e:
-                if self.running:
+                if self.running and self.endpoints_running:
                     log(f"IN writer error on EP#{ep_num}: {e}", "ERROR")
                 break
     
@@ -506,7 +510,7 @@ class USBProxy:
         """Thread to read from gadget endpoint (OUT from host) and queue for device"""
         log(f"Thread started: OUT reader for gadget EP#{ep_num}", "THREAD")
         
-        while self.running:
+        while self.running and self.endpoints_running:
             try:
                 if ep_type == USB_ENDPOINT_XFER_BULK:
                     data = self.ep_read(ep_num, 4096)
@@ -520,7 +524,7 @@ class USBProxy:
                     queue.put(data)
                     log(f"  OUT ← host: {len(data)} bytes from EP#{ep_num} | Data: {data[:16].hex()}{'...' if len(data) > 16 else ''}", "DATA")
             except Exception as e:
-                if self.running:
+                if self.running and self.endpoints_running:
                     log(f"OUT reader error on EP#{ep_num}: {e}", "ERROR")
                 break
     
@@ -528,7 +532,7 @@ class USBProxy:
         """Thread to write queued data to device endpoint (send to printer)"""
         log(f"Thread started: OUT writer for device EP{hex(ep_addr)}", "THREAD")
         
-        while self.running:
+        while self.running and self.endpoints_running:
             try:
                 data = queue.get(timeout=0.1)
                 if ep_addr & 0x80:
@@ -541,7 +545,7 @@ class USBProxy:
             except Empty:
                 continue
             except Exception as e:
-                if self.running:
+                if self.running and self.endpoints_running:
                     log(f"OUT writer error on EP{hex(ep_addr)}: {e}", "ERROR")
                 break
     
@@ -628,8 +632,40 @@ class USBProxy:
                     
                     self.endpoint_threads.extend([reader, writer])
     
+    def cleanup_endpoints(self):
+        """Clean up endpoint threads and queues on host disconnect/reset"""
+        if not self.endpoint_threads:
+            return  # Nothing to clean up
+        
+        log("="*60, "INFO")
+        log("CLEANING UP ENDPOINTS", "INFO")
+        log("="*60, "INFO")
+        
+        # Signal endpoint threads to stop
+        self.endpoints_running = False
+        log(f"Stopping {len(self.endpoint_threads)} endpoint thread(s)...", "INFO")
+        
+        # Wait for threads to finish
+        for thread in self.endpoint_threads:
+            if thread.is_alive():
+                thread.join(timeout=2.0)
+                if thread.is_alive():
+                    log(f"Warning: Thread {thread.name} did not stop in time", "WARN")
+                else:
+                    log(f"✓ Thread {thread.name} stopped", "SUCCESS")
+        
+        # Clear thread list and queues
+        self.endpoint_threads.clear()
+        self.endpoint_queues.clear()
+        
+        # Re-enable flag for next connection
+        self.endpoints_running = True
+        
+        log("✓ Endpoint cleanup complete", "SUCCESS")
+        log("="*60, "INFO")
+    
     def ep0_loop(self):
-        """Main EP0 event loop"""
+        """Main EP0 event loop with hotplug support"""
         log("="*60, "INFO")
         log("ENTERING EP0 EVENT LOOP", "INFO")
         log("="*60, "INFO")
@@ -641,7 +677,10 @@ class USBProxy:
                 # Log heartbeat every 5 seconds to show we're still alive
                 current_time = time.time()
                 if current_time - last_heartbeat > 5.0:
-                    log("Still waiting for control requests from host...", "INFO")
+                    if configured:
+                        log("Proxy active, waiting for events...", "INFO")
+                    else:
+                        log("Still waiting for control requests from host...", "INFO")
                     last_heartbeat = current_time
                 
                 event_type, event_data = self.fetch_event()
@@ -657,7 +696,18 @@ class USBProxy:
                 log(f"Event: {event_name} (type={event_type}, data_len={len(event_data)})", "EVENT")
                 
                 if event_type == USB_RAW_EVENT_CONNECT:
-                    log("✓ USB host connected!", "SUCCESS")
+                    log("="*60, "INFO")
+                    log("USB HOST HOTPLUG: CONNECTED", "SUCCESS")
+                    log("="*60, "INFO")
+                    self.host_connected = True
+                    
+                    # If we were previously configured, clean up and reset state
+                    if configured or self.device_configured:
+                        log("Host reconnected, cleaning up previous session...", "INFO")
+                        self.cleanup_endpoints()
+                        configured = False
+                        self.device_configured = False
+                    
                     log("Waiting for control requests from host...", "INFO")
                     continue
                 
@@ -690,25 +740,77 @@ class USBProxy:
                         # Setup endpoint forwarding with actual config VALUE, not index
                         self.setup_endpoints(wValue)
                         configured = True
+                        self.device_configured = True
                         
                         # NOW ACK the request (for OUT with wLength=0, ep0_read ACKs)
                         self.ep0_read(0)
                         log("✓ SET_CONFIGURATION request ACKed", "SUCCESS")
+                        log("="*60, "INFO")
+                        log("DEVICE FULLY CONFIGURED AND READY", "SUCCESS")
+                        log("="*60, "INFO")
                         continue
                     
                     # Handle all other control requests normally
                     self.handle_control_request(event_data)
                 
                 elif event_type == USB_RAW_EVENT_RESET:
-                    log("USB RESET event received", "WARN")
-                    configured = False
-                    self.running = False
+                    log("="*60, "WARN")
+                    log("USB HOST HOTPLUG: RESET", "WARN")
+                    log("="*60, "WARN")
+                    
+                    # Clean up endpoints if configured
+                    if configured or self.device_configured:
+                        log("Cleaning up endpoints due to reset...", "INFO")
+                        self.cleanup_endpoints()
+                        configured = False
+                        self.device_configured = False
+                    
+                    # Reset the device (like C++ version - see proxy.cpp line 405)
+                    try:
+                        if self.usb_device:
+                            self.usb_device.reset()
+                            log("✓ Device reset", "SUCCESS")
+                    except Exception as e:
+                        log(f"Error resetting device: {e}", "ERROR")
+                    
+                    log("Host reset. Waiting for re-enumeration...", "INFO")
+                    continue
                     
                 elif event_type == USB_RAW_EVENT_DISCONNECT:
-                    log("USB DISCONNECT event received", "WARN")
-                    self.running = False
+                    log("="*60, "WARN")
+                    log("USB HOST HOTPLUG: DISCONNECTED", "WARN")
+                    log("="*60, "WARN")
+                    self.host_connected = False
+                    
+                    # Clean up endpoints if configured
+                    if configured or self.device_configured:
+                        log("Cleaning up endpoints due to disconnect...", "INFO")
+                        self.cleanup_endpoints()
+                        configured = False
+                        self.device_configured = False
+                    
+                    # Note: C++ version treats DISCONNECT like RESET for dwc2 bug
+                    # Reset the device to prepare for next connection
+                    try:
+                        if self.usb_device:
+                            self.usb_device.reset()
+                            log("✓ Device reset for next connection", "SUCCESS")
+                    except Exception as e:
+                        log(f"Error resetting device: {e}", "ERROR")
+                    
+                    log("Host disconnected. Waiting for reconnection...", "INFO")
+                    continue
+                    
+                elif event_type == USB_RAW_EVENT_SUSPEND:
+                    log("USB SUSPEND event received from host", "INFO")
+                    continue
+                    
+                elif event_type == USB_RAW_EVENT_RESUME:
+                    log("USB RESUME event received from host", "INFO")
+                    continue
+                    
                 else:
-                    # Handle any other event types (SUSPEND, RESUME, etc.)
+                    # Handle any other event types
                     log(f"Unhandled event type: {event_name} (type={event_type})", "INFO")
                     continue
                     
