@@ -71,8 +71,15 @@ USB_DIR_OUT = 0x00
 USB_DIR_IN = 0x80
 USB_TYPE_STANDARD = 0x00
 USB_TYPE_MASK = 0x60
+USB_REQ_GET_STATUS = 0x00
+USB_REQ_CLEAR_FEATURE = 0x01
+USB_REQ_SET_FEATURE = 0x03
+USB_REQ_SET_ADDRESS = 0x05
 USB_REQ_GET_DESCRIPTOR = 0x06
+USB_REQ_SET_DESCRIPTOR = 0x07
+USB_REQ_GET_CONFIGURATION = 0x08
 USB_REQ_SET_CONFIGURATION = 0x09
+USB_REQ_GET_INTERFACE = 0x0a
 USB_REQ_SET_INTERFACE = 0x0b
 
 # USB Descriptor types
@@ -135,6 +142,25 @@ class USBProxy:
             log("  Detaching kernel driver...", "INFO")
             dev.detach_kernel_driver(0)
             log("  ✓ Kernel driver detached", "SUCCESS")
+        
+        # Reset device before proxy (like C++ version - device-libusb.cpp line 146)
+        # This ensures device is in a clean state
+        try:
+            log("  Resetting device...", "INFO")
+            dev.reset()
+            log("  ✓ Device reset", "SUCCESS")
+        except Exception as e:
+            log(f"  Warning: Device reset failed: {e} (continuing anyway)", "WARN")
+        
+        # Check that device is responsive (like C++ version - device-libusb.cpp line 155-162)
+        try:
+            log("  Checking device responsiveness...", "INFO")
+            # Try to read string descriptor 0 (language IDs)
+            unused = dev.ctrl_transfer(0x80, 0x06, 0x0300, 0x0409, 4, timeout=1000)
+            log("  ✓ Device is responsive", "SUCCESS")
+        except Exception as e:
+            log(f"  ERROR: Device unresponsive: {e}", "ERROR")
+            raise ValueError(f"Device unresponsive: {e}")
         
         # Cache all descriptors BEFORE host connects (like C++ version)
         log("="*60, "INFO")
@@ -452,15 +478,35 @@ class USBProxy:
                 self.ep0_write(bytes(data))
                 log(f"  ✓ Forwarded {len(data)} bytes to host", "CTRL")
             else:
-                # OUT transfer - read from host (and ACK), send to device
+                # OUT transfer - forward to device, then ACK
+                # CRITICAL: Order matters! Forward first, ACK only if successful (like C++ version)
                 if wLength > 0:
-                    # ep0_read reads data AND ACKs the request
+                    # For non-zero length: ep0_read reads data AND ACKs the request
                     data = self.ep0_read(wLength)
-                    self.usb_device.ctrl_transfer(bmRequestType, bRequest, wValue, wIndex, data, timeout=1000)
+                    # Now forward to device
+                    result = self.usb_device.ctrl_transfer(bmRequestType, bRequest, wValue, wIndex, data, timeout=1000)
+                    if result < 0:
+                        raise Exception(f"Device control transfer failed: {result}")
                 else:
-                    # For wLength=0, we need to ACK by reading (even though no data)
-                    self.usb_device.ctrl_transfer(bmRequestType, bRequest, wValue, wIndex, None, timeout=1000)
-                    self.ep0_read(0)  # ACK the request
+                    # For wLength=0: Forward to device FIRST, then ACK only if successful
+                    # This matches C++ behavior (proxy.cpp lines 619-639)
+                    try:
+                        result = self.usb_device.ctrl_transfer(bmRequestType, bRequest, wValue, wIndex, None, timeout=1000)
+                        if result == 0:
+                            # Device accepted - ACK the request
+                            self.ep0_read(0)  # ACK
+                            log(f"  ✓ Forwarded to device and ACKed", "CTRL")
+                        else:
+                            # Device rejected - stall
+                            log(f"  Device rejected (result={result}), stalling", "WARN")
+                            self.ep0_stall()
+                            return
+                    except Exception as e:
+                        # Device error - stall
+                        log(f"  Device error: {e}, stalling", "ERROR")
+                        self.ep0_stall()
+                        return
+                    return  # Already logged, don't log again below
                 log(f"  ✓ Forwarded to device", "CTRL")
         except Exception as e:
             log(f"  ✗ Error: {e}, stalling EP0", "ERROR")
@@ -719,6 +765,15 @@ class USBProxy:
                         continue
                     
                     bmRequestType, bRequest, wValue, wIndex, wLength = struct.unpack("<BBHHH", event_data[:8])
+                    
+                    # Handle SET_ADDRESS - this is handled by gadget, not forwarded to device
+                    if (bmRequestType & USB_TYPE_MASK) == USB_TYPE_STANDARD and \
+                       bRequest == USB_REQ_SET_ADDRESS:
+                        log(f"SET_ADDRESS: address={wValue} (handled by gadget)", "INFO")
+                        # Just ACK the request - gadget handles address assignment
+                        self.ep0_read(0)  # ACK
+                        log("✓ SET_ADDRESS ACKed", "SUCCESS")
+                        continue
                     
                     # Handle SET_CONFIGURATION specially BEFORE forwarding (like C++ version)
                     if (bmRequestType & USB_TYPE_MASK) == USB_TYPE_STANDARD and \
