@@ -120,19 +120,12 @@ void *ep_loop_write(void *arg) {
 
 	while (!please_stop_eps) {
 		assert(ep_num != -1);
-		
-		// Simplified: wait for data with minimal delay for immediate forwarding
+		if (data_queue->size() == 0) {
+			usleep(100);
+			continue;
+		}
+
 		data_mutex->lock();
-		while (data_queue->size() == 0 && !please_stop_eps) {
-			data_mutex->unlock();
-			usleep(100);  // Minimal sleep to avoid busy-wait, but forward immediately when data arrives
-			data_mutex->lock();
-		}
-		if (please_stop_eps) {
-			data_mutex->unlock();
-			break;
-		}
-		
 		struct usb_raw_transfer_io io = data_queue->front();
 		data_queue->pop_front();
 		data_mutex->unlock();
@@ -168,8 +161,7 @@ void *ep_loop_write(void *arg) {
 			int length = io.inner.length;
 			unsigned char *data = new unsigned char[length];
 			memcpy(data, io.data, length);
-			// Simplified: blocking transfer (timeout parameter ignored, always uses 0)
-			int rv = send_data(ep.bEndpointAddress, ep.bmAttributes, data, length, 0);
+			int rv = send_data(ep.bEndpointAddress, ep.bmAttributes, data, length, USB_REQUEST_TIMEOUT);
 			if (rv == LIBUSB_ERROR_NO_DEVICE) {
 				printf("EP%x(%s_%s): device likely reset, stopping thread\n",
 					ep.bEndpointAddress, transfer_type.c_str(), dir.c_str());
@@ -211,10 +203,13 @@ void *ep_loop_read(void *arg) {
 			unsigned char *data = NULL;
 			int nbytes = -1;
 
-			// Simplified: removed queue size check delay - forward immediately
-			// Simplified: blocking transfer (timeout parameter ignored, always uses 0)
+			if (data_queue->size() >= 32) {
+				usleep(200);
+				continue;
+			}
+
 			int rv = receive_data(ep.bEndpointAddress, ep.bmAttributes, usb_endpoint_maxp(&ep),
-						&data, &nbytes, 0);
+						&data, &nbytes, USB_REQUEST_TIMEOUT);
 			if (rv == LIBUSB_ERROR_NO_DEVICE) {
 				printf("EP%x(%s_%s): device likely reset, stopping thread\n",
 					ep.bEndpointAddress, transfer_type.c_str(), dir.c_str());
@@ -442,8 +437,7 @@ void ep0_loop(int fd) {
 
 		int rv = -1;
 		if (event.ctrl.bRequestType & USB_DIR_IN) {
-			// Simplified: blocking transfer (timeout=0) for immediate forwarding
-			result = control_request(&event.ctrl, &nbytes, &control_data, 0);
+			result = control_request(&event.ctrl, &nbytes, &control_data, USB_REQUEST_TIMEOUT);
 			if (result == 0) {
 				memcpy(&io.data[0], control_data, nbytes);
 				io.inner.length = nbytes;
@@ -629,8 +623,7 @@ void ep0_loop(int fd) {
 					if (verbose_level >= 2)
 						printData(io, 0x00, "control", "out");
 
-					// Simplified: blocking transfer (timeout=0) for immediate forwarding
-					result = control_request(&event.ctrl, &nbytes, &control_data, 0);
+					result = control_request(&event.ctrl, &nbytes, &control_data, USB_REQUEST_TIMEOUT);
 					if (result == 0) {
 						// Ack the request.
 						rv = usb_raw_ep0_read(fd, (struct usb_raw_ep_io *)&io);
@@ -664,8 +657,7 @@ void ep0_loop(int fd) {
 
 					memcpy(control_data, io.data, event.ctrl.wLength);
 
-					// Simplified: blocking transfer (timeout=0) for immediate forwarding
-					result = control_request(&event.ctrl, &nbytes, &control_data, 0);
+					result = control_request(&event.ctrl, &nbytes, &control_data, USB_REQUEST_TIMEOUT);
 					if (result == 0) {
 						printf("ep0: transferred %d bytes (out)\n", rv);
 					}

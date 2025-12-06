@@ -2,7 +2,9 @@
 
 #include "misc.h"
 
-#define USB_REQUEST_TIMEOUT 0  // 0 = blocking, no timeout for immediate forwarding
+#define USB_REQUEST_TIMEOUT 1000
+
+#define MAX_ATTEMPTS 5
 
 extern libusb_device			**devs;
 extern libusb_device_handle		*dev_handle;

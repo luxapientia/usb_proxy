@@ -23,8 +23,7 @@ void *hotplug_monitor(void *arg __attribute__((unused))) {
 	printf("Start hotplug_monitor thread, thread id(%d)\n", gettid());
 	while(true) {
 		usleep(100 * 1000);
-		// Use the same context as the main thread to avoid API misuse
-		libusb_handle_events_completed(context, NULL);
+		libusb_handle_events_completed(NULL, NULL);
 	}
 }
 
@@ -222,12 +221,10 @@ void set_interface_alt_setting(int interface, int altsetting) {
 
 int control_request(const usb_ctrlrequest *setup_packet, int *nbytes,
 			unsigned char **dataptr, int timeout) {
-	(void)timeout;  // Parameter kept for API compatibility, always uses blocking (0)
-	// Simplified: use blocking transfer (timeout=0) for immediate forwarding
 	int result = libusb_control_transfer(dev_handle,
 					setup_packet->bRequestType, setup_packet->bRequest,
 					setup_packet->wValue, setup_packet->wIndex, *dataptr,
-					setup_packet->wLength, 0);
+					setup_packet->wLength, timeout);
 
 	if (result < 0) {
 		if (verbose_level) {
@@ -249,9 +246,11 @@ int control_request(const usb_ctrlrequest *setup_packet, int *nbytes,
 
 int send_data(uint8_t endpoint, uint8_t attributes, uint8_t *dataptr,
 			int length, int timeout) {
-	(void)timeout;  // Parameter kept for API compatibility, always uses blocking (0)
 	int transferred;
+	int attempt = 0;
 	int result = LIBUSB_SUCCESS;
+
+	bool incomplete_transfer = false;
 
 	switch (attributes & USB_ENDPOINT_XFERTYPE_MASK) {
 	case USB_ENDPOINT_XFER_CONTROL:
@@ -262,19 +261,38 @@ int send_data(uint8_t endpoint, uint8_t attributes, uint8_t *dataptr,
 			fprintf(stderr, "Isochronous(write) endpoint EP%02x unhandled.\n", endpoint);
 		break;
 	case USB_ENDPOINT_XFER_BULK:
-		// Simplified: single transfer, no retries, blocking (timeout=0)
-		result = libusb_bulk_transfer(dev_handle, endpoint, dataptr, length, &transferred, 0);
-		if (result == LIBUSB_SUCCESS && verbose_level > 2)
-			printf("Sent %d bytes (Bulk) to EP%02x\n", transferred, endpoint);
+		do {
+			result = libusb_bulk_transfer(dev_handle, endpoint, dataptr, length, &transferred, timeout);
+			//TODO retry transfer if incomplete
+			if (transferred != length) {
+				fprintf(stderr, "Incomplete Bulk transfer on EP%02x for attempt %d. length(%d), transferred(%d)\n",
+					endpoint, attempt, length, transferred);
+				incomplete_transfer = true;
+			}
+			if (result == LIBUSB_SUCCESS) {
+				if (incomplete_transfer)
+					printf("Resent Bulk transfer on EP%02x for attempt %d. length(%d), transferred(%d)\n",
+						endpoint, attempt, length, transferred);
+				if (verbose_level > 2)
+					printf("Sent %d bytes (Bulk) to EP%02x\n", transferred, endpoint);
+			}
+			if ((result == LIBUSB_ERROR_PIPE || result == LIBUSB_ERROR_TIMEOUT))
+				libusb_clear_halt(dev_handle, endpoint);
+
+			attempt++;
+		} while ((result == LIBUSB_ERROR_PIPE || result == LIBUSB_ERROR_TIMEOUT || transferred != length)
+					&& attempt < MAX_ATTEMPTS);
 		break;
 	case USB_ENDPOINT_XFER_INT:
-		// Simplified: single transfer, blocking (timeout=0)
-		result = libusb_interrupt_transfer(dev_handle, endpoint, dataptr, length, &transferred, 0);
+		result = libusb_interrupt_transfer(dev_handle, endpoint, dataptr, length, &transferred, timeout);
+
+		if (transferred != length)
+			fprintf(stderr, "Incomplete Interrupt transfer on EP%02x\n", endpoint);
 		if (result == LIBUSB_SUCCESS && verbose_level > 2)
 			printf("Sent %d bytes (Int) to libusb EP%02x\n", transferred, endpoint);
 		break;
 	}
-	if (result != LIBUSB_SUCCESS && result != LIBUSB_ERROR_NO_DEVICE) {
+	if (result != LIBUSB_SUCCESS) {
 		fprintf(stderr, "Transfer error sending on EP%02x: %s\n",
 				endpoint, libusb_strerror((libusb_error)result));
 	}
@@ -288,11 +306,11 @@ void iso_transfer_callback(struct libusb_transfer *transfer) {
 
 int receive_data(uint8_t endpoint, uint8_t attributes, uint16_t maxPacketSize,
 			uint8_t **dataptr, int *length, int timeout) {
-	(void)timeout;  // Parameter kept for API compatibility, always uses blocking (0)
 	int result = LIBUSB_SUCCESS;
 	struct libusb_transfer *transfer;
 	int iso_completed, iso_packets;
 
+	int attempt = 0;
 	switch (attributes & USB_ENDPOINT_XFERTYPE_MASK) {
 	case USB_ENDPOINT_XFER_CONTROL:
 		fprintf(stderr, "Can't read on a control endpoint.\n");
@@ -311,7 +329,7 @@ int receive_data(uint8_t endpoint, uint8_t attributes, uint16_t maxPacketSize,
 		}
 		iso_completed = 0;
 		libusb_fill_iso_transfer(transfer, dev_handle, endpoint, *dataptr, maxPacketSize,
-					iso_packets, iso_transfer_callback, &iso_completed, 0);
+					iso_packets, iso_transfer_callback, &iso_completed, timeout);
 		libusb_set_iso_packet_lengths(transfer, maxPacketSize / iso_packets);
 		result = libusb_submit_transfer(transfer);
 		if (result != LIBUSB_SUCCESS) {
@@ -319,7 +337,7 @@ int receive_data(uint8_t endpoint, uint8_t attributes, uint16_t maxPacketSize,
 			break;
 		}
 		while (!iso_completed)
-			libusb_handle_events_completed(context, &iso_completed);
+			libusb_handle_events_completed(NULL, &iso_completed);
 		*length = 0;
 		for (int i = 0; i < iso_packets; i++)
 			*length += transfer->iso_packet_desc[i].actual_length;
@@ -328,22 +346,26 @@ int receive_data(uint8_t endpoint, uint8_t attributes, uint16_t maxPacketSize,
 		libusb_free_transfer(transfer);
 		break;
 	case USB_ENDPOINT_XFER_BULK:
-		// Simplified: single transfer, no retries, blocking (timeout=0)
 		*dataptr = new uint8_t[maxPacketSize * 8];
-		result = libusb_bulk_transfer(dev_handle, endpoint, *dataptr, maxPacketSize * 8, length, 0);
-		if (result == LIBUSB_SUCCESS && verbose_level > 2)
-			printf("Received bulk data(%d) bytes\n", *length);
+		do {
+			result = libusb_bulk_transfer(dev_handle, endpoint, *dataptr, maxPacketSize, length, timeout);
+			if (result == LIBUSB_SUCCESS && verbose_level > 2)
+				printf("Received bulk data(%d) bytes\n", *length);
+			if ((result == LIBUSB_ERROR_PIPE || result == LIBUSB_ERROR_TIMEOUT))
+				libusb_clear_halt(dev_handle, endpoint);
+
+			attempt++;
+		} while ((result == LIBUSB_ERROR_PIPE || result == LIBUSB_ERROR_TIMEOUT) && attempt < MAX_ATTEMPTS);
 		break;
 	case USB_ENDPOINT_XFER_INT:
-		// Simplified: single transfer, blocking (timeout=0)
 		*dataptr = new uint8_t[maxPacketSize];
-		result = libusb_interrupt_transfer(dev_handle, endpoint, *dataptr, maxPacketSize, length, 0);
+		result = libusb_interrupt_transfer(dev_handle, endpoint, *dataptr, maxPacketSize, length, timeout);
 		if (result == LIBUSB_SUCCESS && verbose_level > 2)
 			printf("Received int data(%d) bytes\n", *length);
 		break;
 	}
 
-	if (result != LIBUSB_SUCCESS && result != LIBUSB_ERROR_NO_DEVICE) {
+	if (result != LIBUSB_SUCCESS) {
 		fprintf(stderr, "Transfer error receiving on EP%02x: %s\n",
 				endpoint, libusb_strerror((libusb_error)result));
 	}
