@@ -221,6 +221,7 @@ void set_interface_alt_setting(int interface, int altsetting) {
 
 int control_request(const usb_ctrlrequest *setup_packet, int *nbytes,
 			unsigned char **dataptr, int timeout) {
+	(void)timeout;  // Parameter kept for API compatibility, always uses blocking (0)
 	// Simplified: use blocking transfer (timeout=0) for immediate forwarding
 	int result = libusb_control_transfer(dev_handle,
 					setup_packet->bRequestType, setup_packet->bRequest,
@@ -247,6 +248,7 @@ int control_request(const usb_ctrlrequest *setup_packet, int *nbytes,
 
 int send_data(uint8_t endpoint, uint8_t attributes, uint8_t *dataptr,
 			int length, int timeout) {
+	(void)timeout;  // Parameter kept for API compatibility, always uses blocking (0)
 	int transferred;
 	int result = LIBUSB_SUCCESS;
 
@@ -285,6 +287,7 @@ void iso_transfer_callback(struct libusb_transfer *transfer) {
 
 int receive_data(uint8_t endpoint, uint8_t attributes, uint16_t maxPacketSize,
 			uint8_t **dataptr, int *length, int timeout) {
+	(void)timeout;  // Parameter kept for API compatibility, always uses blocking (0)
 	int result = LIBUSB_SUCCESS;
 	struct libusb_transfer *transfer;
 	int iso_completed, iso_packets;
