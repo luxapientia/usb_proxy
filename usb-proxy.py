@@ -305,6 +305,58 @@ class USBProxy:
             log(f"  IOCTL number: {hex(USB_RAW_IOCTL_INIT)}", "ERROR")
             raise
     
+    def ensure_clean_connection(self):
+        """Ensure RPi is disconnected from POS, then wait for fresh connection"""
+        log("="*60, "INFO")
+        log("ENSURING CLEAN DISCONNECT/RECONNECT CYCLE", "INFO")
+        log("="*60, "INFO")
+        
+        # First, start the gadget
+        log("Starting gadget to check connection state...", "INFO")
+        import fcntl
+        fcntl.ioctl(self.gadget_fd, USB_RAW_IOCTL_RUN)
+        log("✓ Gadget started", "SUCCESS")
+        
+        # Now check for immediate CONNECT event (means we were already connected)
+        log("Checking for existing connection...", "INFO")
+        try:
+            # Set a short timeout to check for immediate events
+            # Use select to check if there's data available (non-blocking check)
+            import select
+            ready, _, _ = select.select([self.gadget_fd], [], [], 0.1)
+            
+            if ready:
+                # There's an event available - fetch it
+                event_type, event_data = self.fetch_event()
+                if event_type == USB_RAW_EVENT_CONNECT:
+                    log("⚠ Already connected to POS - waiting for disconnect...", "WARN")
+                    # Wait for DISCONNECT event
+                    while self.running:
+                        event_type, event_data = self.fetch_event()
+                        if event_type == USB_RAW_EVENT_DISCONNECT:
+                            log("✓ Disconnected from POS", "SUCCESS")
+                            log("Waiting for fresh connection from POS...", "INFO")
+                            # Wait a moment for the disconnect to fully propagate
+                            time.sleep(0.5)
+                            break
+                        elif event_type == 0:
+                            # No event or error
+                            time.sleep(0.1)
+                            continue
+                elif event_type == USB_RAW_EVENT_DISCONNECT:
+                    log("✓ Already disconnected - ready for fresh connection", "SUCCESS")
+                else:
+                    # Some other event - put it back by handling it in the main loop
+                    log(f"Received {event_type} event, will handle in main loop", "INFO")
+            else:
+                log("✓ No immediate connection detected - ready for fresh connection", "SUCCESS")
+        except Exception as e:
+            log(f"Error checking connection state: {e} (continuing anyway)", "WARN")
+        
+        log("="*60, "INFO")
+        log("Ready for POS to connect", "INFO")
+        log("="*60, "INFO")
+    
     def run_gadget(self):
         """Start the gadget"""
         log("Starting gadget...", "INFO")
@@ -894,7 +946,9 @@ class USBProxy:
             # Open and initialize gadget
             self.open_raw_gadget()
             self.init_gadget()
-            self.run_gadget()
+            
+            # Ensure clean disconnect/reconnect cycle before starting
+            self.ensure_clean_connection()
             
             # Start EP0 loop
             self.ep0_loop()
